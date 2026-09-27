@@ -277,7 +277,7 @@ describe('processRetryFailedImports', () => {
     );
   });
 
-  it('skips SABnzbd retries when download dir is missing', async () => {
+  it('returns awaiting_import request to awaiting_search when SABnzbd job no longer exists', async () => {
     const sabClientMock = {
       clientType: 'sabnzbd',
       protocol: 'usenet',
@@ -305,6 +305,17 @@ describe('processRetryFailedImports', () => {
 
     expect(result.skipped).toBe(1);
     expect(jobQueueMock.addOrganizeJob).not.toHaveBeenCalled();
+    expect(prismaMock.request.update).toHaveBeenCalledWith(
+  expect.objectContaining({
+    where: { id: 'req-5' },
+    data: expect.objectContaining({
+      status: 'awaiting_search',
+      progress: 0,
+      errorMessage: null,
+      importAttempts: 0,
+    }),
+  })
+);
   });
 
   it('skips requests with no client identifiers or names', async () => {
@@ -458,6 +469,14 @@ describe('processRetryFailedImports', () => {
 
     expect(result.triggered).toBe(0);
     expect(result.skipped).toBe(1);
+    expect(prismaMock.request.update).not.toHaveBeenCalledWith(
+  expect.objectContaining({
+    where: { id: 'req-10' },
+    data: expect.objectContaining({
+      status: 'awaiting_search',
+    }),
+  })
+);
   });
 
   it('uses stored downloadPath when client throws', async () => {

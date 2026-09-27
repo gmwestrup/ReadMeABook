@@ -164,16 +164,53 @@ export async function processRetryFailedImports(payload: RetryFailedImportsPaylo
             if (client) {
               try {
                 const info = await client.getDownload(clientId);
-                if (info?.downloadPath) {
-                  downloadPath = PathMapper.transform(info.downloadPath, mappingConfig);
-                  logger.info(
-                    `Got download path from ${client.clientType} for request ${request.id}: ${info.downloadPath}` +
-                    (downloadPath !== info.downloadPath ? ` → ${downloadPath} (mapped)` : '')
-                  );
-                } else {
-                  // Download found but no path — try stored path, then fallback
-                  downloadPath = getStoredPath(downloadHistory, request.id, logger) || await getFallbackPath(downloadHistory, configService, mappingConfig, request.id, logger, manager, protocol);
-                }
+
+if (!info) {
+  // The download client is reachable, but this job no longer exists in
+  // its queue or history. A stored/fallback path may be stale, so do not
+  // keep retrying an import that can never succeed. Return the request
+  // to the normal search retry pipeline.
+  logger.warn(
+    `Download ${clientId} no longer exists in ${client.clientType} for request ${request.id}; returning request to awaiting_search`
+  );
+
+  await prisma.request.update({
+    where: { id: request.id },
+    data: {
+      status: 'awaiting_search',
+      progress: 0,
+      errorMessage: null,
+      importAttempts: 0,
+      lastImportAt: new Date(),
+      updatedAt: new Date(),
+    },
+  });
+
+  skipped++;
+  continue;
+}
+
+if (info.downloadPath) {
+  downloadPath = PathMapper.transform(info.downloadPath, mappingConfig);
+  logger.info(
+    `Got download path from ${client.clientType} for request ${request.id}: ${info.downloadPath}` +
+    (downloadPath !== info.downloadPath ? ` → ${downloadPath} (mapped)` : '')
+  );
+} else {
+  // Download still exists in the client but has no usable path yet.
+  // Preserve the existing stored/fallback path behavior.
+  downloadPath =
+    getStoredPath(downloadHistory, request.id, logger) ||
+    await getFallbackPath(
+      downloadHistory,
+      configService,
+      mappingConfig,
+      request.id,
+      logger,
+      manager,
+      protocol
+    );
+}
               } catch (clientError) {
                 // Client error — try stored path, then fallback
                 logger.warn(`${client.clientType} error for request ${request.id}: ${clientError instanceof Error ? clientError.message : 'Unknown error'}, using fallback path`);
