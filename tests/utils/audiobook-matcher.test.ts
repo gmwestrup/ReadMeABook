@@ -19,8 +19,11 @@ vi.mock('@/lib/db', () => ({
 
 describe('audiobook-matcher', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-  });
+  vi.clearAllMocks();
+
+  // By default, the requested ASIN has no known sibling ASINs.
+  prismaMock.workAsin.findMany.mockResolvedValue([]);
+});
 
   it('returns ASIN exact match from dedicated field', async () => {
     prismaMock.plexLibrary.findMany.mockResolvedValue([
@@ -43,6 +46,68 @@ describe('audiobook-matcher', () => {
 
     expect(match?.plexGuid).toBe('guid-1');
   });
+
+  it('matches a library item through a known regional sibling ASIN', async () => {
+  // First Works query: requested ASIN belongs to this Work.
+  // Second Works query: retrieve all ASINs belonging to that Work.
+  prismaMock.workAsin.findMany
+    .mockResolvedValueOnce([
+      {
+        asin: 'B009SDRTNG',
+        workId: 'forgotten-work',
+      },
+    ])
+    .mockResolvedValueOnce([
+      {
+        asin: 'B009SDRTNG',
+        workId: 'forgotten-work',
+      },
+      {
+        asin: 'B009ON9QK4',
+        workId: 'forgotten-work',
+      },
+    ]);
+
+  // Audiobookshelf contains the alternate/regional ASIN.
+  prismaMock.plexLibrary.findMany.mockResolvedValue([
+    {
+      plexGuid: 'abs-forgotten',
+      plexRatingKey: 'forgotten-rating-key',
+      title: 'The Forgotten',
+      author: 'David Baldacci',
+      asin: 'B009ON9QK4',
+      isbn: null,
+    },
+  ]);
+
+  const { findPlexMatch } = await import('@/lib/utils/audiobook-matcher');
+
+  const match = await findPlexMatch({
+    asin: 'B009SDRTNG',
+    title: 'The Forgotten',
+    author: 'David Baldacci',
+    narrator: 'Ron McLarty, Orlagh Cassidy',
+  });
+
+  expect(match).not.toBeNull();
+  expect(match?.asin).toBe('B009ON9QK4');
+  expect(match?.title).toBe('The Forgotten');
+
+  // Verify that the library query included BOTH the requested ASIN
+  // and its known sibling ASIN.
+  expect(prismaMock.plexLibrary.findMany).toHaveBeenCalledWith(
+    expect.objectContaining({
+      where: {
+        OR: [
+          { asin: 'B009SDRTNG' },
+          { plexGuid: { contains: 'B009SDRTNG' } },
+          { asin: 'B009ON9QK4' },
+          { plexGuid: { contains: 'B009ON9QK4' } },
+        ],
+      },
+    })
+  );
+});
 
   it('rejects candidates with mismatched ASINs in plexGuid', async () => {
     prismaMock.plexLibrary.findMany.mockResolvedValue([

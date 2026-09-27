@@ -15,6 +15,10 @@ const audiobookMatcherMock = vi.hoisted(() => ({
   findPlexMatch: vi.fn(),
 }));
 
+const worksServiceMock = vi.hoisted(() => ({
+  seedAsin: vi.fn(),
+}));
+
 vi.mock('@/lib/db', () => ({
   prisma: prismaMock,
 }));
@@ -39,6 +43,10 @@ vi.mock('@/lib/utils/audiobook-matcher', () => ({
   findPlexMatch: audiobookMatcherMock.findPlexMatch,
 }));
 
+vi.mock('@/lib/services/works.service', () => ({
+  seedAsin: worksServiceMock.seedAsin,
+}));
+
 describe('processSearchIndexers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -46,60 +54,143 @@ describe('processSearchIndexers', () => {
     // Default to empty blocklist so the filter is a no-op unless a test overrides.
     prismaMock.blockedRelease.findMany.mockResolvedValue([]);
     audiobookMatcherMock.findPlexMatch.mockResolvedValue(null);
+    worksServiceMock.seedAsin.mockResolvedValue(undefined);
   });
 
-  it('skips indexer search when exact ASIN is already available in library', async () => {
-  audiobookMatcherMock.findPlexMatch.mockResolvedValue({
-    plexGuid: 'abs-item-123',
-    plexRatingKey: null,
-    title: 'Book',
-    author: 'Author',
-  });
-
-  prismaMock.request.update.mockResolvedValue({});
-
-  const { processSearchIndexers } = await import('@/lib/processors/search-indexers.processor');
-
-  const result = await processSearchIndexers({
-    requestId: 'req-library-match',
-    audiobook: {
-      id: 'a-library-match',
+    it('skips indexer search when exact ASIN is already available in library', async () => {
+    audiobookMatcherMock.findPlexMatch.mockResolvedValue({
+      plexGuid: 'abs-item-123',
+      plexRatingKey: null,
       title: 'Book',
       author: 'Author',
-      asin: 'B012345678',
-    },
-    jobId: 'job-library-match',
-  });
+    });
 
-  expect(audiobookMatcherMock.findPlexMatch).toHaveBeenCalledWith({
-    asin: 'B012345678',
-    title: 'Book',
-    author: 'Author',
-  });
+    prismaMock.request.update.mockResolvedValue({});
 
-  expect(prismaMock.request.update).toHaveBeenCalledWith({
-    where: { id: 'req-library-match' },
-    data: expect.objectContaining({
-      status: 'available',
-      errorMessage: null,
-      searchAttempts: 0,
-      downloadAttempts: 0,
-      importAttempts: 0,
-    }),
-  });
+    const { processSearchIndexers } = await import(
+      '@/lib/processors/search-indexers.processor'
+    );
 
-  expect(prowlarrMock.searchWithVariations).not.toHaveBeenCalled();
-  expect(jobQueueMock.addDownloadJob).not.toHaveBeenCalled();
-
-  expect(result).toEqual(
-    expect.objectContaining({
-      success: true,
-      skipped: true,
-      reason: 'already_available',
+    const result = await processSearchIndexers({
       requestId: 'req-library-match',
-    })
-  );
-});
+      audiobook: {
+        id: 'a-library-match',
+        title: 'Book',
+        author: 'Author',
+        asin: 'B012345678',
+      },
+      jobId: 'job-library-match',
+    });
+
+    expect(audiobookMatcherMock.findPlexMatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        asin: 'B012345678',
+        title: 'Book',
+        author: 'Author',
+      })
+    );
+
+    expect(prismaMock.request.update).toHaveBeenCalledWith({
+      where: { id: 'req-library-match' },
+      data: expect.objectContaining({
+        status: 'available',
+        errorMessage: null,
+        searchAttempts: 0,
+        downloadAttempts: 0,
+        importAttempts: 0,
+      }),
+    });
+
+        expect(prowlarrMock.search).not.toHaveBeenCalled();
+    expect(prowlarrMock.searchWithVariations).not.toHaveBeenCalled();
+    expect(jobQueueMock.addDownloadJob).not.toHaveBeenCalled();
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        success: true,
+        skipped: true,
+        reason: 'already_available',
+        requestId: 'req-library-match',
+      })
+    );
+  });
+
+  it('stops The Forgotten regional ASIN before searching indexers', async () => {
+    prismaMock.request.findUnique.mockResolvedValue({
+      id: 'req-forgotten',
+      audiobook: {
+        audibleAsin: 'B009SDRTNG',
+        title: 'The Forgotten',
+        author: 'David Baldacci',
+        narrator: 'Ron McLarty, Orlagh Cassidy',
+      },
+    });
+
+    audiobookMatcherMock.findPlexMatch.mockResolvedValue({
+      plexGuid: 'abs-forgotten',
+      plexRatingKey: null,
+      title: 'The Forgotten',
+      author: 'David Baldacci',
+      asin: 'B009ON9QK4',
+    });
+
+    prismaMock.request.update.mockResolvedValue({});
+
+    const { processSearchIndexers } = await import(
+      '@/lib/processors/search-indexers.processor'
+    );
+
+    const result = await processSearchIndexers({
+      requestId: 'req-forgotten',
+      audiobook: {
+        id: 'a-forgotten',
+        title: 'The Forgotten',
+        author: 'David Baldacci',
+        asin: 'B009SDRTNG',
+      },
+      jobId: 'job-forgotten',
+    });
+
+    expect(worksServiceMock.seedAsin).toHaveBeenCalledWith(
+      'B009SDRTNG',
+      'The Forgotten',
+      'David Baldacci',
+      'Ron McLarty, Orlagh Cassidy',
+      undefined
+    );
+
+    expect(audiobookMatcherMock.findPlexMatch).toHaveBeenCalledWith({
+      asin: 'B009SDRTNG',
+      title: 'The Forgotten',
+      author: 'David Baldacci',
+      narrator: 'Ron McLarty, Orlagh Cassidy',
+    });
+
+    expect(prismaMock.request.update).toHaveBeenCalledWith({
+      where: { id: 'req-forgotten' },
+      data: expect.objectContaining({
+        status: 'available',
+        errorMessage: null,
+        searchAttempts: 0,
+        downloadAttempts: 0,
+        importAttempts: 0,
+      }),
+    });
+
+    expect(prowlarrMock.search).not.toHaveBeenCalled();
+    expect(prowlarrMock.searchWithVariations).not.toHaveBeenCalled();
+    expect(jobQueueMock.addDownloadJob).not.toHaveBeenCalled();
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        success: true,
+        skipped: true,
+        reason: 'already_available',
+        requestId: 'req-forgotten',
+      })
+    );
+  });
+
 
   it('marks request awaiting_search when no results found', async () => {
     configMock.get.mockImplementation(async (key: string) => {

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Component: Search Indexers Job Processor
  * Documentation: documentation/phase3/README.md
  */
@@ -13,6 +13,7 @@ import { getLanguageForRegion } from '../constants/language-config';
 import { filterBlockedResults } from '../utils/filter-blocked-results';
 import type { AudibleRegion } from '../types/audible';
 import { findPlexMatch } from '../utils/audiobook-matcher';
+import { seedAsin } from '../services/works.service';
 
 const MAX_RANKED_RESULTS = 100;
 
@@ -28,20 +29,56 @@ export async function processSearchIndexers(payload: SearchIndexersPayload): Pro
   logger.info(`Processing request ${requestId} for "${audiobook.title}"`);
 
   try {
-    // Last-chance library availability guard.
-    // A request may have been queued before Audiobookshelf learned about the book
-    // or before a full library scan reconciled it. Re-check the library immediately
-    // before searching indexers so we do not download a duplicate.
+        // Last-chance library availability guard.
+    // Load authoritative audiobook metadata from the request so this protection
+    // also works for older queued jobs whose payload does not contain narrator.
     if (audiobook.asin) {
+      const requestWithAudiobook = await prisma.request.findUnique({
+        where: { id: requestId },
+        include: { audiobook: true },
+      });
+
+      const requestAudiobook = requestWithAudiobook?.audiobook;
+
+      const matchAsin =
+        requestAudiobook?.audibleAsin ||
+        audiobook.asin;
+
+      const matchTitle =
+        requestAudiobook?.title ||
+        audiobook.title;
+
+      const matchAuthor =
+        requestAudiobook?.author ||
+        audiobook.author;
+
+      const matchNarrator =
+        requestAudiobook?.narrator ||
+        audiobook.narrator ||
+        undefined;
+
+      // Reconcile known regional/alternate ASINs before checking the library.
+      // seedAsin() only merges when title + author + narrator identify exactly
+      // one compatible Work.
+      await seedAsin(
+        matchAsin,
+        matchTitle,
+        matchAuthor,
+        matchNarrator,
+        undefined
+      );
+
+      // findPlexMatch expands the reconciled ASIN through known sibling ASINs.
       const libraryMatch = await findPlexMatch({
-        asin: audiobook.asin,
-        title: audiobook.title,
-        author: audiobook.author,
+        asin: matchAsin,
+        title: matchTitle,
+        author: matchAuthor,
+        narrator: matchNarrator,
       });
 
       if (libraryMatch) {
         logger.info(
-          `Skipping indexer search for request ${requestId}: exact ASIN ${audiobook.asin} is already available in the library`
+          `Skipping indexer search for request ${requestId}: ASIN ${matchAsin} or a known sibling ASIN is already available in the library`
         );
 
         await prisma.request.update({
@@ -61,11 +98,13 @@ export async function processSearchIndexers(payload: SearchIndexersPayload): Pro
           success: true,
           skipped: true,
           reason: 'already_available',
-          message: 'Audiobook is already available in the library; indexer search skipped',
+          message:
+            'Audiobook is already available in the library; indexer search skipped',
           requestId,
         };
       }
     }
+
     // Update request status to searching
     await prisma.request.update({
       where: { id: requestId },
@@ -162,7 +201,7 @@ export async function processSearchIndexers(payload: SearchIndexersPayload): Pro
     logger.info(`Found ${searchResults.length} total results from ${groups.length} group${groups.length > 1 ? 's' : ''}${blockedCount > 0 ? ` (${blockedCount} blocked)` : ''}`);
 
     if (searchResults.length === 0) {
-      // No usable results — either Prowlarr returned nothing, or the blocklist
+      // No usable results - either Prowlarr returned nothing, or the blocklist
       // removed everything it returned. Surface a blocklist-specific message in
       // the latter case so admins know to unblock (or accept it as terminal).
       const allBlocked = blockedCount > 0 && preBlocklistCount > 0;

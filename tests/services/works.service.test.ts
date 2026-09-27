@@ -182,6 +182,7 @@ describe('seedAsin', () => {
 
   it('creates single-ASIN work for new ASIN', async () => {
     prismaMock.workAsin.findUnique.mockResolvedValue(null);
+    prismaMock.work.findMany.mockResolvedValue([]);
     prismaMock.work.create.mockResolvedValue({ id: 'new-work' });
     prismaMock.workAsin.create.mockResolvedValue({});
 
@@ -198,6 +199,179 @@ describe('seedAsin', () => {
         asin: 'NEW_ASIN',
         narrator: 'Narrator',
         durationMinutes: 300,
+        isCanonical: true,
+        source: 'dedup_auto',
+      },
+    });
+  });
+
+  it('reconciles a regional ASIN with an existing work for the same recording', async () => {
+    prismaMock.workAsin.findUnique.mockResolvedValue(null);
+
+    prismaMock.work.findMany.mockResolvedValue([
+      {
+        id: 'forgotten-work',
+        title: 'The Forgotten',
+        author: 'David Baldacci',
+        asins: [
+          {
+            asin: 'B009ON9QK4',
+            narrator: 'Ron McLarty, Orlagh Cassidy',
+            durationMinutes: null,
+          },
+        ],
+      },
+    ]);
+
+    prismaMock.workAsin.create.mockResolvedValue({});
+
+    const { seedAsin } = await import('@/lib/services/works.service');
+
+    await seedAsin(
+      'B009SDRTNG',
+      'The Forgotten',
+      'David Baldacci',
+      'Ron McLarty, Orlagh Cassidy',
+      undefined
+    );
+
+    expect(prismaMock.work.create).not.toHaveBeenCalled();
+
+    expect(prismaMock.workAsin.create).toHaveBeenCalledWith({
+      data: {
+        workId: 'forgotten-work',
+        asin: 'B009SDRTNG',
+        narrator: 'Ron McLarty, Orlagh Cassidy',
+        durationMinutes: undefined,
+        isCanonical: false,
+        source: 'dedup_auto',
+      },
+    });
+  });
+
+  it('reconciles an already-tracked regional ASIN from a separate work', async () => {
+    prismaMock.workAsin.findUnique.mockResolvedValue({
+      id: 'requested-entry',
+      asin: 'B009SDRTNG',
+      workId: 'wrong-work',
+    });
+
+    prismaMock.work.findMany.mockResolvedValue([
+      {
+        id: 'wrong-work',
+        title: 'The Forgotten',
+        author: 'David Baldacci',
+        asins: [
+          {
+            asin: 'B009SDRTNG',
+            narrator: 'Ron McLarty, Orlagh Cassidy',
+            durationMinutes: null,
+          },
+        ],
+      },
+      {
+        id: 'correct-work',
+        title: 'The Forgotten',
+        author: 'David Baldacci',
+        asins: [
+          {
+            asin: 'B009ON9QK4',
+            narrator: 'Ron McLarty, Orlagh Cassidy',
+            durationMinutes: null,
+          },
+        ],
+      },
+    ]);
+
+    prismaMock.workAsin.update.mockResolvedValue({});
+    prismaMock.workAsin.count.mockResolvedValue(0);
+    prismaMock.work.delete.mockResolvedValue({});
+
+    const { seedAsin } = await import('@/lib/services/works.service');
+
+    await seedAsin(
+      'B009SDRTNG',
+      'The Forgotten',
+      'David Baldacci',
+      'Ron McLarty, Orlagh Cassidy',
+      undefined
+    );
+
+    expect(prismaMock.workAsin.update).toHaveBeenCalledWith({
+      where: { asin: 'B009SDRTNG' },
+      data: {
+        workId: 'correct-work',
+        narrator: 'Ron McLarty, Orlagh Cassidy',
+        durationMinutes: undefined,
+        isCanonical: false,
+      },
+    });
+
+    expect(prismaMock.workAsin.count).toHaveBeenCalledWith({
+      where: { workId: 'wrong-work' },
+    });
+
+    expect(prismaMock.work.delete).toHaveBeenCalledWith({
+      where: { id: 'wrong-work' },
+    });
+
+    expect(prismaMock.work.create).not.toHaveBeenCalled();
+  });
+
+  it('does not reconcile books when the full titles differ', async () => {
+    prismaMock.workAsin.findUnique.mockResolvedValue(null);
+
+    prismaMock.work.findMany.mockResolvedValue([
+      {
+        id: 'existing-work',
+        title: 'The Forgotten: A John Puller Novel',
+        author: 'David Baldacci',
+        asins: [
+          {
+            asin: 'EXISTING_ASIN',
+            narrator: 'Ron McLarty, Orlagh Cassidy',
+            durationMinutes: null,
+          },
+        ],
+      },
+    ]);
+
+    prismaMock.work.create.mockResolvedValue({ id: 'new-work' });
+    prismaMock.workAsin.create.mockResolvedValue({});
+
+    const { seedAsin } = await import('@/lib/services/works.service');
+
+    await seedAsin(
+      'NEW_ASIN',
+      'The Forgotten',
+      'David Baldacci',
+      'Ron McLarty, Orlagh Cassidy',
+      undefined
+    );
+
+    // Same author and narrators are not enough.
+    // Full title must also match for automatic cross-ASIN reconciliation.
+    expect(prismaMock.workAsin.create).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          workId: 'existing-work',
+        }),
+      })
+    );
+
+    expect(prismaMock.work.create).toHaveBeenCalledWith({
+      data: {
+        title: 'The Forgotten',
+        author: 'David Baldacci',
+      },
+    });
+
+    expect(prismaMock.workAsin.create).toHaveBeenCalledWith({
+      data: {
+        workId: 'new-work',
+        asin: 'NEW_ASIN',
+        narrator: 'Ron McLarty, Orlagh Cassidy',
+        durationMinutes: undefined,
         isCanonical: true,
         source: 'dedup_auto',
       },

@@ -42,7 +42,7 @@ export interface AudiobookMatchResult {
 export async function findPlexMatch(
   audiobook: AudiobookMatchInput
 ): Promise<AudiobookMatchResult | null> {
-  // Early return if no ASIN provided (prevents empty string matching all records)
+  // Early return if no ASIN provided.
   if (!audiobook.asin || audiobook.asin.trim() === '') {
     logger.debug('Matcher result', {
       MATCHER: {
@@ -56,19 +56,27 @@ export async function findPlexMatch(
         matchType: 'no_asin_provided',
         matched: false,
         result: null,
-      }
+      },
     });
+
     return null;
   }
 
-  // Query plex_library directly by ASIN (indexed O(1) lookup)
-  // Check both dedicated asin field and plexGuid for backward compatibility
+  // Build the complete set of known ASINs for this recording.
+  // The requested ASIN remains first priority, followed by sibling/regional
+  // ASINs already associated with the same Work.
+  const siblingMap = await getSiblingAsins([audiobook.asin]);
+  const siblingAsins = siblingMap.get(audiobook.asin) || [];
+  const candidateAsins = [audiobook.asin, ...siblingAsins];
+
+  // Query the library for the requested ASIN or any known sibling ASIN.
+  // This remains exact-ASIN matching; there is no fuzzy library fallback.
   const plexBooks = await prisma.plexLibrary.findMany({
     where: {
-      OR: [
-        { asin: audiobook.asin },
-        { plexGuid: { contains: audiobook.asin } },
-      ],
+      OR: candidateAsins.flatMap((asin) => [
+        { asin },
+        { plexGuid: { contains: asin } },
+      ]),
     },
     select: {
       plexGuid: true,
@@ -79,13 +87,13 @@ export async function findPlexMatch(
     },
   });
 
-  // Build match result for logging
   const matchResult: any = {
     input: {
       title: audiobook.title,
       author: audiobook.author,
       narrator: audiobook.narrator || null,
       asin: audiobook.asin,
+      candidateAsins,
     },
     candidatesFound: plexBooks.length,
     matchType: null,
@@ -93,47 +101,69 @@ export async function findPlexMatch(
     result: null,
   };
 
-  // If no ASIN matches found, log and return null
   if (plexBooks.length === 0) {
     matchResult.matchType = 'no_asin_match';
     logger.debug('Matcher result', { MATCHER: matchResult });
     return null;
   }
 
-  // PRIORITY 1a: Check for EXACT ASIN match in dedicated field (works for all backends)
-  for (const plexBook of plexBooks) {
-    if (plexBook.asin && plexBook.asin.toLowerCase() === audiobook.asin.toLowerCase()) {
-      matchResult.matchType = 'asin_exact_field';
-      matchResult.matched = true;
-      matchResult.result = {
-        plexGuid: plexBook.plexGuid,
-        plexTitle: plexBook.title,
-        plexAuthor: plexBook.author,
-        asin: plexBook.asin,
-        confidence: 100,
-      };
-      logger.debug('Matcher result', { MATCHER: matchResult });
-      return plexBook;
+  // PRIORITY 1a: Dedicated ASIN field.
+  // candidateAsins keeps the requested ASIN first, followed by known siblings.
+  for (const candidateAsin of candidateAsins) {
+    for (const plexBook of plexBooks) {
+      if (
+        plexBook.asin &&
+        plexBook.asin.toLowerCase() === candidateAsin.toLowerCase()
+      ) {
+        matchResult.matchType =
+          candidateAsin === audiobook.asin
+            ? 'asin_exact_field'
+            : 'asin_sibling_field';
+
+        matchResult.matched = true;
+        matchResult.result = {
+          plexGuid: plexBook.plexGuid,
+          plexTitle: plexBook.title,
+          plexAuthor: plexBook.author,
+          asin: plexBook.asin,
+          matchedAsin: candidateAsin,
+          confidence: 100,
+        };
+
+        logger.debug('Matcher result', { MATCHER: matchResult });
+        return plexBook;
+      }
     }
   }
 
-  // PRIORITY 1b: Check for ASIN in plexGuid (backward compatibility for Plex)
-  for (const plexBook of plexBooks) {
-    if (plexBook.plexGuid && plexBook.plexGuid.includes(audiobook.asin)) {
-      matchResult.matchType = 'asin_exact_guid';
-      matchResult.matched = true;
-      matchResult.result = {
-        plexGuid: plexBook.plexGuid,
-        plexTitle: plexBook.title,
-        plexAuthor: plexBook.author,
-        confidence: 100,
-      };
-      logger.debug('Matcher result', { MATCHER: matchResult });
-      return plexBook;
+  // PRIORITY 1b: ASIN in plexGuid for backward compatibility with Plex.
+  for (const candidateAsin of candidateAsins) {
+    for (const plexBook of plexBooks) {
+      if (
+        plexBook.plexGuid &&
+        plexBook.plexGuid.includes(candidateAsin)
+      ) {
+        matchResult.matchType =
+          candidateAsin === audiobook.asin
+            ? 'asin_exact_guid'
+            : 'asin_sibling_guid';
+
+        matchResult.matched = true;
+        matchResult.result = {
+          plexGuid: plexBook.plexGuid,
+          plexTitle: plexBook.title,
+          plexAuthor: plexBook.author,
+          matchedAsin: candidateAsin,
+          confidence: 100,
+        };
+
+        logger.debug('Matcher result', { MATCHER: matchResult });
+        return plexBook;
+      }
     }
   }
 
-  // No exact match found (shouldn't happen given the query, but defensive)
+  // Defensive fallback. The DB query should normally prevent reaching this.
   matchResult.matchType = 'no_exact_match';
   logger.debug('Matcher result', { MATCHER: matchResult });
   return null;

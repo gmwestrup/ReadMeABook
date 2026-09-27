@@ -9,7 +9,11 @@
 
 import { prisma } from '@/lib/db';
 import { RMABLogger } from '@/lib/utils/logger';
-import { metadataScore, type DedupGroup } from '@/lib/utils/deduplicate-audiobooks';
+import {
+  metadataScore,
+  areDurationsCompatible,
+  type DedupGroup,
+} from '@/lib/utils/deduplicate-audiobooks';
 import type { AudibleAudiobook } from '@/lib/integrations/audible.service';
 
 const logger = RMABLogger.create('WorksService');
@@ -134,6 +138,23 @@ async function persistSingleGroup(group: DedupGroup): Promise<void> {
   }
 }
 
+function normalizeIdentityValue(value?: string): string {
+  return (value || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeNarratorIdentity(narrator?: string): string {
+  return (narrator || '')
+    .toLowerCase()
+    .split(',')
+    .map(name => name.trim())
+    .filter(Boolean)
+    .sort()
+    .join(', ');
+}
+
 // ---------------------------------------------------------------------------
 // Layer 2: Seed ASIN at request time
 // ---------------------------------------------------------------------------
@@ -152,13 +173,141 @@ export async function seedAsin(
   durationMinutes?: number
 ): Promise<void> {
   try {
-    // Check if ASIN already tracked
     const existing = await prisma.workAsin.findUnique({
       where: { asin },
     });
+
+    const normalizedTitle = normalizeIdentityValue(title);
+    const normalizedAuthor = normalizeIdentityValue(author);
+    const normalizedNarrator = normalizeNarratorIdentity(narrator);
+
+    // Conservative reconciliation:
+    // Require title + author + narrator before attempting to associate
+    // regional/alternate ASINs with an existing Work.
+    if (normalizedTitle && normalizedAuthor && normalizedNarrator) {
+      const candidateWorks = await prisma.work.findMany({
+        include: {
+          asins: true,
+        },
+      });
+
+      const compatibleWorks = candidateWorks.filter(work => {
+        // Do not compare an already-tracked ASIN against its own current Work.
+        if (existing && work.id === existing.workId) {
+          return false;
+        }
+
+        if (normalizeIdentityValue(work.title) !== normalizedTitle) {
+          return false;
+        }
+
+        if (normalizeIdentityValue(work.author) !== normalizedAuthor) {
+          return false;
+        }
+
+        return work.asins.some(entry => {
+          const existingNarrator = normalizeNarratorIdentity(
+            entry.narrator ?? undefined
+          );
+
+          if (
+            !existingNarrator ||
+            existingNarrator !== normalizedNarrator
+          ) {
+            return false;
+          }
+
+          return areDurationsCompatible(
+            entry.durationMinutes ?? undefined,
+            durationMinutes
+          );
+        });
+      });
+
+      // Only reconcile when exactly one other compatible Work exists.
+      if (compatibleWorks.length === 1) {
+        const targetWork = compatibleWorks[0];
+
+        if (existing) {
+          const oldWorkId = existing.workId;
+
+          // Move this already-tracked ASIN to the compatible Work.
+          // It is not canonical there; preserve the target Work's canonical ASIN.
+          await prisma.workAsin.update({
+            where: { asin },
+            data: {
+              workId: targetWork.id,
+              narrator,
+              durationMinutes,
+              isCanonical: false,
+            },
+          });
+
+          // Remove the old Work only if it no longer contains any ASINs.
+          const remainingEntries = await prisma.workAsin.count({
+            where: { workId: oldWorkId },
+          });
+
+          if (remainingEntries === 0) {
+            await prisma.work.delete({
+              where: { id: oldWorkId },
+            });
+          }
+
+          logger.info('Reconciled existing ASIN with compatible work', {
+            asin,
+            oldWorkId,
+            workId: targetWork.id,
+            title,
+            author,
+          });
+
+          return;
+        }
+
+        // New ASIN: attach it directly to the compatible Work.
+        await prisma.workAsin.create({
+          data: {
+            workId: targetWork.id,
+            asin,
+            narrator,
+            durationMinutes,
+            isCanonical: false,
+            source: 'dedup_auto',
+          },
+        });
+
+        logger.info('Reconciled ASIN with existing work', {
+          workId: targetWork.id,
+          asin,
+          title,
+          author,
+        });
+
+        return;
+      }
+
+      if (compatibleWorks.length > 1) {
+        logger.warn(
+          'Multiple compatible works found; skipping automatic reconciliation',
+          {
+            asin,
+            title,
+            author,
+            compatibleWorkIds: compatibleWorks.map(work => work.id),
+          }
+        );
+
+        // Already tracked: safest action is to leave it exactly where it is.
+        if (existing) return;
+      }
+    }
+
+    // Existing ASIN with no single safe reconciliation target:
+    // preserve its current Work.
     if (existing) return;
 
-    // Create a new single-ASIN work
+    // New ASIN with no safe existing match: create a new Work.
     const work = await prisma.work.create({
       data: { title, author },
     });
