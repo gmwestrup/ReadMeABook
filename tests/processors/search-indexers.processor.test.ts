@@ -11,6 +11,9 @@ const prismaMock = createPrismaMock();
 const configMock = vi.hoisted(() => ({ get: vi.fn(), getAudibleRegion: vi.fn().mockResolvedValue('us') }));
 const jobQueueMock = createJobQueueMock();
 const prowlarrMock = vi.hoisted(() => ({ search: vi.fn(), searchWithVariations: vi.fn() }));
+const audiobookMatcherMock = vi.hoisted(() => ({
+  findPlexMatch: vi.fn(),
+}));
 
 vi.mock('@/lib/db', () => ({
   prisma: prismaMock,
@@ -32,13 +35,71 @@ vi.mock('@/lib/integrations/audible.service', () => ({
   getAudibleService: () => ({ getRuntime: vi.fn().mockResolvedValue(null) }),
 }));
 
+vi.mock('@/lib/utils/audiobook-matcher', () => ({
+  findPlexMatch: audiobookMatcherMock.findPlexMatch,
+}));
+
 describe('processSearchIndexers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     configMock.getAudibleRegion.mockResolvedValue('us');
     // Default to empty blocklist so the filter is a no-op unless a test overrides.
     prismaMock.blockedRelease.findMany.mockResolvedValue([]);
+    audiobookMatcherMock.findPlexMatch.mockResolvedValue(null);
   });
+
+  it('skips indexer search when exact ASIN is already available in library', async () => {
+  audiobookMatcherMock.findPlexMatch.mockResolvedValue({
+    plexGuid: 'abs-item-123',
+    plexRatingKey: null,
+    title: 'Book',
+    author: 'Author',
+  });
+
+  prismaMock.request.update.mockResolvedValue({});
+
+  const { processSearchIndexers } = await import('@/lib/processors/search-indexers.processor');
+
+  const result = await processSearchIndexers({
+    requestId: 'req-library-match',
+    audiobook: {
+      id: 'a-library-match',
+      title: 'Book',
+      author: 'Author',
+      asin: 'B012345678',
+    },
+    jobId: 'job-library-match',
+  });
+
+  expect(audiobookMatcherMock.findPlexMatch).toHaveBeenCalledWith({
+    asin: 'B012345678',
+    title: 'Book',
+    author: 'Author',
+  });
+
+  expect(prismaMock.request.update).toHaveBeenCalledWith({
+    where: { id: 'req-library-match' },
+    data: expect.objectContaining({
+      status: 'available',
+      errorMessage: null,
+      searchAttempts: 0,
+      downloadAttempts: 0,
+      importAttempts: 0,
+    }),
+  });
+
+  expect(prowlarrMock.searchWithVariations).not.toHaveBeenCalled();
+  expect(jobQueueMock.addDownloadJob).not.toHaveBeenCalled();
+
+  expect(result).toEqual(
+    expect.objectContaining({
+      success: true,
+      skipped: true,
+      reason: 'already_available',
+      requestId: 'req-library-match',
+    })
+  );
+});
 
   it('marks request awaiting_search when no results found', async () => {
     configMock.get.mockImplementation(async (key: string) => {

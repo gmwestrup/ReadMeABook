@@ -12,6 +12,7 @@ import { RMABLogger } from '../utils/logger';
 import { getLanguageForRegion } from '../constants/language-config';
 import { filterBlockedResults } from '../utils/filter-blocked-results';
 import type { AudibleRegion } from '../types/audible';
+import { findPlexMatch } from '../utils/audiobook-matcher';
 
 const MAX_RANKED_RESULTS = 100;
 
@@ -27,6 +28,44 @@ export async function processSearchIndexers(payload: SearchIndexersPayload): Pro
   logger.info(`Processing request ${requestId} for "${audiobook.title}"`);
 
   try {
+    // Last-chance library availability guard.
+    // A request may have been queued before Audiobookshelf learned about the book
+    // or before a full library scan reconciled it. Re-check the library immediately
+    // before searching indexers so we do not download a duplicate.
+    if (audiobook.asin) {
+      const libraryMatch = await findPlexMatch({
+        asin: audiobook.asin,
+        title: audiobook.title,
+        author: audiobook.author,
+      });
+
+      if (libraryMatch) {
+        logger.info(
+          `Skipping indexer search for request ${requestId}: exact ASIN ${audiobook.asin} is already available in the library`
+        );
+
+        await prisma.request.update({
+          where: { id: requestId },
+          data: {
+            status: 'available',
+            completedAt: new Date(),
+            errorMessage: null,
+            searchAttempts: 0,
+            downloadAttempts: 0,
+            importAttempts: 0,
+            updatedAt: new Date(),
+          },
+        });
+
+        return {
+          success: true,
+          skipped: true,
+          reason: 'already_available',
+          message: 'Audiobook is already available in the library; indexer search skipped',
+          requestId,
+        };
+      }
+    }
     // Update request status to searching
     await prisma.request.update({
       where: { id: requestId },
