@@ -122,6 +122,16 @@ export async function processDownloadTorrent(payload: DownloadTorrentPayload): P
 
       logger.info(`Download added with ID: ${downloadClientId}`);
 
+      // Count only downloads that were successfully accepted by the client.
+      // Search/grab failures before this point do not consume a download attempt.
+      await prisma.request.update({
+        where: { id: requestId },
+        data: {
+          downloadAttempts: { increment: 1 },
+          updatedAt: new Date(),
+        },
+      });
+
       // Create DownloadHistory record. Exclude magnet links from the indexer-page fallback.
       const indexerPageUrl = candidate.infoUrl || (candidate.guid?.startsWith('magnet:') ? null : candidate.guid);
 

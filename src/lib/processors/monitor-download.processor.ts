@@ -12,6 +12,7 @@ import { getDownloadClientManager } from '../services/download-client-manager.se
 import { CLIENT_PROTOCOL_MAP, DownloadClientType } from '../interfaces/download-client.interface';
 import { isTransientConnectionError } from '../utils/connection-errors';
 import { addAutoBlock } from '../services/blocklist.service';
+import type { SABnzbdService } from '../integrations/sabnzbd.service';
 
 /**
  * Map a download client's error signal to a coarse, human-readable reason
@@ -87,6 +88,17 @@ export async function processMonitorDownload(payload: MonitorDownloadPayload): P
     // Build progress object for request updates
     const progressPercent = Math.round(info.progress * 100);
     const progressState = info.status;
+
+    // Load the request's accepted-download attempt count.
+    // downloadAttempts is incremented only after a download client accepts a job.
+    const requestState = await prisma.request.findUnique({
+      where: { id: requestId },
+      select: {
+        downloadAttempts: true,
+      },
+    });
+
+    const downloadAttempts = requestState?.downloadAttempts ?? 0;
 
     if (client.protocol === 'usenet') {
       logger.info(`${client.clientType} status: ${info.status}`, {
@@ -224,15 +236,35 @@ export async function processMonitorDownload(payload: MonitorDownloadPayload): P
       const errorMessage = `Download failed in ${client.clientType}`;
       const clientErrorDetail = info.errorMessage ?? null;
 
-      // Update request to failed
+      const MAX_DOWNLOAD_ATTEMPTS = 3;
+      const shouldRetry = downloadAttempts < MAX_DOWNLOAD_ATTEMPTS;
+
+      // A confirmed client-side failure consumes an accepted download attempt.
+      // Retry with a different release while the request still has attempts left.
+      // The failed release is blocklisted below so the next search will not
+      // immediately select the same bad release again.
       await prisma.request.update({
         where: { id: requestId },
         data: {
-          status: 'failed',
-          errorMessage,
+          status: shouldRetry ? 'awaiting_search' : 'failed',
+          progress: 0,
+          errorMessage: shouldRetry
+            ? `Download failed in ${client.clientType}; retrying with another release (${downloadAttempts}/${MAX_DOWNLOAD_ATTEMPTS})`
+            : `Download failed in ${client.clientType}; maximum download attempts reached (${downloadAttempts}/${MAX_DOWNLOAD_ATTEMPTS})`,
+          lastSearchAt: shouldRetry ? null : undefined,
           updatedAt: new Date(),
         },
       });
+
+      if (shouldRetry) {
+        logger.warn(
+          `Download attempt ${downloadAttempts}/${MAX_DOWNLOAD_ATTEMPTS} failed for request ${requestId}; returning request to awaiting_search`
+        );
+      } else {
+        logger.error(
+          `Download attempt ${downloadAttempts}/${MAX_DOWNLOAD_ATTEMPTS} failed for request ${requestId}; maximum download attempts reached`
+        );
+      }
 
       // Update download history
       await prisma.downloadHistory.update({
@@ -264,36 +296,67 @@ export async function processMonitorDownload(payload: MonitorDownloadPayload): P
         });
       }
 
-      // Send notification for request failure
-      const request = await prisma.request.findUnique({
-        where: { id: requestId },
-        include: {
-          audiobook: true,
-          user: { select: { plexUsername: true } },
-        },
-      });
+      // SABnzbd keeps failed downloads in History and may leave partial files behind.
+      // Permanently clean the failed SAB job after its failure details have been
+      // recorded and blocklisted. Cleanup is best-effort and must never prevent
+      // the request from recovering to awaiting_search.
+      if (client.clientType === 'sabnzbd') {
+        try {
+          await (client as SABnzbdService).deleteFailedFromHistory(downloadClientId);
+          logger.info(
+            `Cleaned failed SABnzbd download ${downloadClientId} from history and removed associated files`
+          );
+        } catch (cleanupError) {
+          logger.warn(
+            `Failed to clean SABnzbd download ${downloadClientId}; request recovery will continue`,
+            {
+              error: cleanupError instanceof Error
+                ? cleanupError.message
+                : String(cleanupError),
+            }
+          );
+        }
+      }
 
-      if (request) {
-        const jobQueue = getJobQueueService();
-        await jobQueue.addNotificationJob(
-          'request_error',
-          request.id,
-          request.audiobook.title,
-          request.audiobook.author,
-          request.user.plexUsername || 'Unknown User',
-          errorMessage
-        ).catch((error) => {
-          logger.error('Failed to queue notification', { error: error instanceof Error ? error.message : String(error) });
+           // Send notification only after the final download attempt fails.
+      // Recoverable failures return to awaiting_search without notifying
+      // the user that the overall request has failed.
+      if (!shouldRetry) {
+        const request = await prisma.request.findUnique({
+          where: { id: requestId },
+          include: {
+            audiobook: true,
+            user: { select: { plexUsername: true } },
+          },
         });
+
+        if (request) {
+          const jobQueue = getJobQueueService();
+          await jobQueue.addNotificationJob(
+            'request_error',
+            request.id,
+            request.audiobook.title,
+            request.audiobook.author,
+            request.user.plexUsername || 'Unknown User',
+            errorMessage
+          ).catch((error) => {
+            logger.error('Failed to queue notification', {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        }
       }
 
       return {
         success: false,
         completed: true,
-        message: 'Download failed',
+        message: shouldRetry
+          ? 'Download failed, returning request to search'
+          : 'Download failed after maximum attempts',
         requestId,
         progress: progressPercent,
       };
+
     } else {
       // Still downloading — compute adaptive poll interval
       const isStalled = info.downloadSpeed === 0

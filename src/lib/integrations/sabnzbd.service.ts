@@ -762,6 +762,37 @@ export class SABnzbdService implements IDownloadClient {
     }
   }
 
+    /**
+   * Permanently delete a failed NZB from SABnzbd history and remove
+   * any files SABnzbd still has associated with the failed job.
+   *
+   * This is intentionally separate from archiveFromHistory(), which
+   * preserves successful history for troubleshooting.
+   */
+  async deleteFailedFromHistory(nzbId: string): Promise<void> {
+    logger.info(`Permanently deleting failed NZB from history: ${nzbId}`);
+
+    const response = await this.client.get('/api', {
+      params: {
+        mode: 'history',
+        name: 'delete',
+        value: nzbId,
+        del_files: '1',
+        archive: '0',
+        output: 'json',
+        apikey: this.apiKey,
+      },
+    });
+
+    logger.info(`SABnzbd failed history delete response: ${JSON.stringify(response.data)}`);
+
+    if (response.data?.status === false) {
+      throw new Error(
+        response.data.error || `Failed to permanently delete NZB ${nzbId} from history`
+      );
+    }
+  }
+
   /**
    * Archive completed NZB from history after file organization
    * Note: Only archives from history (not queue). If still in queue, something went wrong.
