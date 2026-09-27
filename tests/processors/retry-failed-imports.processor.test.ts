@@ -17,7 +17,9 @@ const downloadClientManagerMock = vi.hoisted(() => ({
   getClientForProtocol: vi.fn(),
   getClientServiceForProtocol: vi.fn(),
 }));
-
+const audiobookMatcherMock = vi.hoisted(() => ({
+  findPlexMatch: vi.fn(),
+}));
 vi.mock('@/lib/db', () => ({
   prisma: prismaMock,
 }));
@@ -34,10 +36,15 @@ vi.mock('@/lib/services/download-client-manager.service', () => ({
   getDownloadClientManager: () => downloadClientManagerMock,
 }));
 
+vi.mock('@/lib/utils/audiobook-matcher', () => ({
+  findPlexMatch: audiobookMatcherMock.findPlexMatch,
+}));
+
 describe('processRetryFailedImports', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-  });
+  vi.clearAllMocks();
+  audiobookMatcherMock.findPlexMatch.mockResolvedValue(null);
+});
 
   it('queues organize jobs using download client paths', async () => {
     const qbtClientMock = {
@@ -105,6 +112,66 @@ describe('processRetryFailedImports', () => {
     expect(result.success).toBe(true);
     expect(result.triggered).toBe(0);
     expect(jobQueueMock.addOrganizeJob).not.toHaveBeenCalled();
+  });
+
+    it('marks audiobook available when exact ASIN is already in library', async () => {
+    audiobookMatcherMock.findPlexMatch.mockResolvedValue({
+      plexGuid: 'abs-item-123',
+      plexRatingKey: null,
+      title: 'Book',
+      author: 'Author',
+    });
+
+    prismaMock.request.findMany.mockResolvedValue([
+      {
+        id: 'req-library-match',
+        type: 'audiobook',
+        audiobook: {
+          id: 'a-library-match',
+          title: 'Book',
+          author: 'Author',
+          audibleAsin: 'B012345678',
+        },
+        downloadHistory: [],
+      },
+    ]);
+
+    prismaMock.request.update.mockResolvedValue({});
+
+    const { processRetryFailedImports } = await import(
+      '@/lib/processors/retry-failed-imports.processor'
+    );
+
+    const result = await processRetryFailedImports({
+      jobId: 'job-library-match',
+    });
+
+    expect(audiobookMatcherMock.findPlexMatch).toHaveBeenCalledWith({
+      asin: 'B012345678',
+      title: 'Book',
+      author: 'Author',
+    });
+
+    expect(prismaMock.request.update).toHaveBeenCalledWith({
+      where: { id: 'req-library-match' },
+      data: expect.objectContaining({
+        status: 'available',
+        errorMessage: null,
+        searchAttempts: 0,
+        downloadAttempts: 0,
+        importAttempts: 0,
+      }),
+    });
+
+    expect(jobQueueMock.addOrganizeJob).not.toHaveBeenCalled();
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        success: true,
+        triggered: 0,
+        skipped: 1,
+      })
+    );
   });
 
   it('skips requests missing download history', async () => {

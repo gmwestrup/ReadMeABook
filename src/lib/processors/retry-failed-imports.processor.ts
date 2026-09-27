@@ -14,6 +14,7 @@ import { getConfigService } from '../services/config.service';
 import { getDownloadClientManager, DownloadClientManager } from '../services/download-client-manager.service';
 import { PathMapper, PathMappingConfig } from '../utils/path-mapper';
 import { CLIENT_PROTOCOL_MAP, DownloadClientType, ProtocolType } from '../interfaces/download-client.interface';
+import { findPlexMatch } from '../utils/audiobook-matcher';
 
 export interface RetryFailedImportsPayload {
   jobId?: string;
@@ -86,6 +87,38 @@ export async function processRetryFailedImports(payload: RetryFailedImportsPaylo
 
     for (const request of requests) {
       try {
+                        // Reconcile stale audiobook import state with the library first.
+        // The book may already have been imported into Audiobookshelf while
+        // the request remained stuck in awaiting_import.
+        if (request.type !== 'ebook' && request.audiobook.audibleAsin) {
+          const libraryMatch = await findPlexMatch({
+            asin: request.audiobook.audibleAsin,
+            title: request.audiobook.title,
+            author: request.audiobook.author,
+          });
+
+          if (libraryMatch) {
+            logger.info(
+              `Request ${request.id} is awaiting import but exact ASIN ${request.audiobook.audibleAsin} is already available in the library; marking available`
+            );
+
+            await prisma.request.update({
+              where: { id: request.id },
+              data: {
+                status: 'available',
+                completedAt: new Date(),
+                errorMessage: null,
+                searchAttempts: 0,
+                downloadAttempts: 0,
+                importAttempts: 0,
+                updatedAt: new Date(),
+              },
+            });
+
+            skipped++;
+            continue;
+          }
+        }
         // Claim this retry slot immediately so every selected row rotates to
         // the back of the next batch, including malformed rows we must skip.
         await prisma.request.update({
