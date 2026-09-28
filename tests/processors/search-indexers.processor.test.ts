@@ -17,6 +17,7 @@ const audiobookMatcherMock = vi.hoisted(() => ({
 
 const worksServiceMock = vi.hoisted(() => ({
   seedAsin: vi.fn(),
+  getSiblingAsins: vi.fn(),
 }));
 
 vi.mock('@/lib/db', () => ({
@@ -45,6 +46,7 @@ vi.mock('@/lib/utils/audiobook-matcher', () => ({
 
 vi.mock('@/lib/services/works.service', () => ({
   seedAsin: worksServiceMock.seedAsin,
+  getSiblingAsins: worksServiceMock.getSiblingAsins,
 }));
 
 describe('processSearchIndexers', () => {
@@ -55,9 +57,10 @@ describe('processSearchIndexers', () => {
     prismaMock.blockedRelease.findMany.mockResolvedValue([]);
     audiobookMatcherMock.findPlexMatch.mockResolvedValue(null);
     worksServiceMock.seedAsin.mockResolvedValue(undefined);
+    worksServiceMock.getSiblingAsins.mockResolvedValue(new Map());
   });
 
-    it('skips indexer search when exact ASIN is already available in library', async () => {
+  it('skips indexer search when exact ASIN is already available in library', async () => {
     audiobookMatcherMock.findPlexMatch.mockResolvedValue({
       plexGuid: 'abs-item-123',
       plexRatingKey: null,
@@ -101,7 +104,7 @@ describe('processSearchIndexers', () => {
       }),
     });
 
-        expect(prowlarrMock.search).not.toHaveBeenCalled();
+    expect(prowlarrMock.search).not.toHaveBeenCalled();
     expect(prowlarrMock.searchWithVariations).not.toHaveBeenCalled();
     expect(jobQueueMock.addDownloadJob).not.toHaveBeenCalled();
 
@@ -187,6 +190,118 @@ describe('processSearchIndexers', () => {
         skipped: true,
         reason: 'already_available',
         requestId: 'req-forgotten',
+      })
+    );
+  });
+
+  it('suppresses a newer active request for a sibling ASIN in the same Work', async () => {
+    const requestedAsin = 'B002V59VJ8';
+    const siblingAsin = 'B002V9ZCYM';
+
+    prismaMock.request.findUnique.mockResolvedValue({
+      id: 'req-nine-dragons-newer',
+      audiobook: {
+        audibleAsin: requestedAsin,
+        title: 'Nine Dragons',
+        author: 'Michael Connelly',
+        narrator: 'Len Cariou',
+      },
+    });
+
+    audiobookMatcherMock.findPlexMatch.mockResolvedValue(null);
+
+    worksServiceMock.getSiblingAsins.mockResolvedValue(
+      new Map([[requestedAsin, [siblingAsin]]])
+    );
+
+    prismaMock.audiobook.findMany.mockResolvedValue([
+      { id: 'audiobook-regional' },
+      { id: 'audiobook-sibling' },
+    ]);
+
+    prismaMock.request.findMany.mockResolvedValue([
+      {
+        id: 'req-nine-dragons-older',
+        createdAt: new Date('2026-09-27T00:15:07.356Z'),
+      },
+      {
+        id: 'req-nine-dragons-newer',
+        createdAt: new Date('2026-09-28T00:02:51.323Z'),
+      },
+    ]);
+
+    prismaMock.request.update.mockResolvedValue({});
+
+    const { processSearchIndexers } = await import(
+      '@/lib/processors/search-indexers.processor'
+    );
+
+    const result = await processSearchIndexers({
+      requestId: 'req-nine-dragons-newer',
+      audiobook: {
+        id: 'audiobook-regional',
+        title: 'Nine Dragons',
+        author: 'Michael Connelly',
+        asin: requestedAsin,
+      },
+      jobId: 'job-nine-dragons-newer',
+    });
+
+    expect(worksServiceMock.seedAsin).toHaveBeenCalledWith(
+      requestedAsin,
+      'Nine Dragons',
+      'Michael Connelly',
+      'Len Cariou',
+      undefined
+    );
+
+    expect(worksServiceMock.getSiblingAsins).toHaveBeenCalledWith([
+      requestedAsin,
+    ]);
+
+    expect(prismaMock.audiobook.findMany).toHaveBeenCalledWith({
+      where: {
+        audibleAsin: {
+          in: [requestedAsin, siblingAsin],
+        },
+      },
+      select: { id: true },
+    });
+
+    expect(prismaMock.request.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          audiobookId: {
+            in: ['audiobook-regional', 'audiobook-sibling'],
+          },
+          type: 'audiobook',
+          deletedAt: null,
+        }),
+        orderBy: [
+          { createdAt: 'asc' },
+          { id: 'asc' },
+        ],
+      })
+    );
+
+    expect(prismaMock.request.update).toHaveBeenCalledWith({
+      where: { id: 'req-nine-dragons-newer' },
+      data: expect.objectContaining({
+        deletedAt: expect.any(Date),
+      }),
+    });
+
+    // Critical protection: the duplicate must stop before Prowlarr or SAB.
+    expect(prowlarrMock.search).not.toHaveBeenCalled();
+    expect(prowlarrMock.searchWithVariations).not.toHaveBeenCalled();
+    expect(jobQueueMock.addDownloadJob).not.toHaveBeenCalled();
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        success: true,
+        skipped: true,
+        reason: 'duplicate_work_request',
+        requestId: 'req-nine-dragons-newer',
       })
     );
   });

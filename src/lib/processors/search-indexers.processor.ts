@@ -13,7 +13,7 @@ import { getLanguageForRegion } from '../constants/language-config';
 import { filterBlockedResults } from '../utils/filter-blocked-results';
 import type { AudibleRegion } from '../types/audible';
 import { findPlexMatch } from '../utils/audiobook-matcher';
-import { seedAsin } from '../services/works.service';
+import { seedAsin, getSiblingAsins } from '../services/works.service';
 
 const MAX_RANKED_RESULTS = 100;
 
@@ -29,7 +29,7 @@ export async function processSearchIndexers(payload: SearchIndexersPayload): Pro
   logger.info(`Processing request ${requestId} for "${audiobook.title}"`);
 
   try {
-        // Last-chance library availability guard.
+    // Last-chance library availability guard.
     // Load authoritative audiobook metadata from the request so this protection
     // also works for older queued jobs whose payload does not contain narrator.
     if (audiobook.asin) {
@@ -100,6 +100,75 @@ export async function processSearchIndexers(payload: SearchIndexersPayload): Pro
           reason: 'already_available',
           message:
             'Audiobook is already available in the library; indexer search skipped',
+          requestId,
+        };
+      }
+
+      // Historical duplicate-request guard.
+      // Multiple regional ASINs can represent the same logical Work. If older
+      // duplicate requests already exist, only the oldest active request is
+      // allowed to continue to Prowlarr/SAB.
+      const siblingMap = await getSiblingAsins([matchAsin]);
+      const siblingAsins = siblingMap.get(matchAsin) || [];
+      const equivalentAsins = [matchAsin, ...siblingAsins];
+
+      const equivalentAudiobooks = await prisma.audiobook.findMany({
+        where: {
+          audibleAsin: { in: equivalentAsins },
+        },
+        select: { id: true },
+      });
+
+      const equivalentAudiobookIds = equivalentAudiobooks.map(
+        (record) => record.id
+      );
+
+      const activeRequestsForWork = await prisma.request.findMany({
+        where: {
+          audiobookId: { in: equivalentAudiobookIds },
+          type: 'audiobook',
+          status: {
+            notIn: [
+              'failed',
+              'warn',
+              'cancelled',
+              'denied',
+              'available',
+              'downloaded',
+            ],
+          },
+          deletedAt: null,
+        },
+        select: {
+          id: true,
+          createdAt: true,
+        },
+        orderBy: [
+          { createdAt: 'asc' },
+          { id: 'asc' },
+        ],
+      });
+
+      const survivingRequest = activeRequestsForWork[0];
+
+      if (survivingRequest && survivingRequest.id !== requestId) {
+        logger.warn(
+          `Skipping duplicate request ${requestId}: Work is already being processed by older request ${survivingRequest.id}`
+        );
+
+        await prisma.request.update({
+          where: { id: requestId },
+          data: {
+            deletedAt: new Date(),
+            updatedAt: new Date(),
+          },
+        });
+
+        return {
+          success: true,
+          skipped: true,
+          reason: 'duplicate_work_request',
+          message: `Duplicate Work request suppressed; older request ${survivingRequest.id} remains active`,
           requestId,
         };
       }
