@@ -169,43 +169,86 @@ export async function createRequestForUser(
     }
   }
 
-  // Seed works table for cross-ASIN matching (Layer 2: request-time seeding)
-  seedAsin(
-    audiobook.asin,
-    audiobookRecord.title,
-    audiobookRecord.author,
-    audiobookRecord.narrator || undefined,
-    undefined // duration not available at request time
-  ).catch(() => {});
+  // Seed/reconcile the Works table before duplicate detection so regional
+  // ASINs belonging to the same audiobook are treated as one logical work.
+  try {
+    await seedAsin(
+      audiobook.asin,
+      audiobookRecord.title,
+      audiobookRecord.author,
+      audiobookRecord.narrator || undefined,
+      undefined // duration not available at request time
+    );
+  } catch (error) {
+    // Works matching is best-effort. Fall back to exact-ASIN duplicate
+    // detection if reconciliation is unavailable.
+    logger.warn(`Failed to seed Works data for ASIN ${audiobook.asin}`, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 
-  // Check if user already has an active request for this audiobook
-  const existingRequest = await prisma.request.findFirst({
+  const siblingMap = await getSiblingAsins([audiobook.asin]).catch(
+    () => new Map<string, string[]>()
+  );
+  const siblingAsins = siblingMap.get(audiobook.asin) || [];
+  const equivalentAsins = [audiobook.asin, ...siblingAsins];
+
+  const equivalentAudiobooks = await prisma.audiobook.findMany({
+    where: {
+      audibleAsin: { in: equivalentAsins },
+    },
+    select: { id: true },
+  });
+
+  const equivalentAudiobookIds = equivalentAudiobooks.map((record) => record.id);
+
+    // Check whether this user already has an active request for this Work.
+  // equivalentAudiobookIds includes audiobook records for regional/sibling ASINs.
+  const existingActiveRequestForUser = await prisma.request.findFirst({
     where: {
       userId,
-      audiobookId: audiobookRecord.id,
+      audiobookId: { in: equivalentAudiobookIds },
       type: 'audiobook',
+      status: { notIn: ['failed', 'warn', 'cancelled'] },
       deletedAt: null,
     },
   });
 
-  if (existingRequest) {
-    const canReRequest = ['failed', 'warn', 'cancelled'].includes(existingRequest.status);
-    if (!canReRequest) {
-      return {
-        success: false,
-        reason: 'duplicate',
-        message: 'You have already requested this audiobook',
-      };
-    }
-    // Delete existing failed/warn/cancelled request
-    logger.debug(`Deleting existing ${existingRequest.status} request ${existingRequest.id} to allow re-request`);
-    await prisma.request.delete({ where: { id: existingRequest.id } });
+  if (existingActiveRequestForUser) {
+    return {
+      success: false,
+      reason: 'duplicate',
+      message: 'You have already requested this audiobook',
+    };
+  }
+
+  // No active request exists for this Work. Remove this user's old terminal
+  // failed/warn/cancelled requests so a clean re-request can be created.
+  const retryableRequests = await prisma.request.findMany({
+    where: {
+      userId,
+      audiobookId: { in: equivalentAudiobookIds },
+      type: 'audiobook',
+      status: { in: ['failed', 'warn', 'cancelled'] },
+      deletedAt: null,
+    },
+    select: {
+      id: true,
+      status: true,
+    },
+  });
+
+  for (const retryableRequest of retryableRequests) {
+    logger.debug(
+      `Deleting existing ${retryableRequest.status} request ${retryableRequest.id} to allow re-request`
+    );
+    await prisma.request.delete({ where: { id: retryableRequest.id } });
   }
 
   // Check ANY user's active request for same audiobook (avoid duplicate processing)
   const anyActiveRequest = await prisma.request.findFirst({
     where: {
-      audiobookId: audiobookRecord.id,
+      audiobookId: { in: equivalentAudiobookIds },
       type: 'audiobook',
       status: { notIn: ['failed', 'warn', 'cancelled', 'available', 'downloaded'] },
       deletedAt: null,

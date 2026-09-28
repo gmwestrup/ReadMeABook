@@ -83,6 +83,7 @@ describe('createRequestForUser — ignore list', () => {
 
     // Default: no existing requests, no library matches
     prismaMock.request.findFirst.mockResolvedValue(null);
+    prismaMock.request.findMany.mockResolvedValue([]);
     prismaMock.audiobook.findFirst.mockResolvedValue(null);
     prismaMock.audiobook.create.mockResolvedValue({
       id: 'audiobook-1',
@@ -91,6 +92,13 @@ describe('createRequestForUser — ignore list', () => {
       author: TEST_AUDIOBOOK.author,
       narrator: null,
     });
+
+    prismaMock.audiobook.findMany.mockResolvedValue([
+      {
+        id: 'audiobook-1',
+      },
+    ]);
+
     prismaMock.request.create.mockResolvedValue({
       id: 'request-1',
       userId: TEST_USER_ID,
@@ -202,7 +210,79 @@ describe('createRequestForUser — ignore list', () => {
     expect(result.success).toBe(true);
     expect(prismaMock.request.create).toHaveBeenCalled();
   });
+  it('blocks a duplicate active request for a sibling ASIN in the same Work', async () => {
+    const requestedAsin = 'B002V59VJ8';
+    const siblingAsin = 'B002V9ZCYM';
 
+    const nineDragons = {
+      asin: requestedAsin,
+      title: 'Nine Dragons',
+      author: 'Michael Connelly',
+      narrator: 'Len Cariou',
+    };
+
+    // Requested regional ASIN already has its own audiobook record.
+    prismaMock.audiobook.findFirst.mockResolvedValue({
+      id: 'audiobook-regional',
+      audibleAsin: requestedAsin,
+      title: 'Nine Dragons',
+      author: 'Michael Connelly',
+      narrator: 'Len Cariou',
+    });
+
+    // Works knows both regional ASINs represent the same audiobook.
+    mockGetSiblingAsins.mockResolvedValue(
+      new Map([[requestedAsin, [siblingAsin]]])
+    );
+
+    // Both ASINs therefore resolve to equivalent audiobook records.
+    prismaMock.audiobook.findMany.mockResolvedValue([
+      { id: 'audiobook-regional' },
+      { id: 'audiobook-sibling' },
+    ]);
+
+    // Existing active request belongs to the sibling audiobook record.
+    prismaMock.request.findFirst
+      .mockResolvedValueOnce(null) // initial downloaded/available exact-ASIN check
+      .mockResolvedValueOnce({
+        id: 'existing-nine-dragons-request',
+        userId: TEST_USER_ID,
+        audiobookId: 'audiobook-sibling',
+        status: 'awaiting_search',
+      });
+
+    const { createRequestForUser } = await import(
+      '@/lib/services/request-creator.service'
+    );
+
+    const result = await createRequestForUser(TEST_USER_ID, nineDragons);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.reason).toBe('duplicate');
+    }
+
+    expect(mockSeedAsin).toHaveBeenCalledWith(
+      requestedAsin,
+      'Nine Dragons',
+      'Michael Connelly',
+      'Len Cariou',
+      undefined
+    );
+
+    expect(prismaMock.audiobook.findMany).toHaveBeenCalledWith({
+      where: {
+        audibleAsin: {
+          in: [requestedAsin, siblingAsin],
+        },
+      },
+      select: { id: true },
+    });
+
+    // Most important protections: no second request and no second search.
+    expect(prismaMock.request.create).not.toHaveBeenCalled();
+    expect(jobQueueAddSearchJob).not.toHaveBeenCalled();
+  });
   it('does not check siblings when no sibling ASINs exist', async () => {
     prismaMock.ignoredAudiobook.findUnique.mockResolvedValue(null);
     mockGetSiblingAsins.mockResolvedValue(new Map());
@@ -221,7 +301,10 @@ describe('createRequestForUser — release-date gate', () => {
     vi.clearAllMocks();
     jobQueueAddSearchJob.mockResolvedValue(undefined);
     jobQueueAddNotificationJob.mockResolvedValue(undefined);
+
     prismaMock.request.findFirst.mockResolvedValue(null);
+    prismaMock.request.findMany.mockResolvedValue([]);
+
     prismaMock.audiobook.findFirst.mockResolvedValue(null);
     prismaMock.audiobook.create.mockResolvedValue({
       id: 'audiobook-1',
@@ -230,6 +313,13 @@ describe('createRequestForUser — release-date gate', () => {
       author: TEST_AUDIOBOOK.author,
       narrator: null,
     });
+
+    prismaMock.audiobook.findMany.mockResolvedValue([
+      {
+        id: 'audiobook-1',
+      },
+    ]);
+
     prismaMock.user.findUnique.mockResolvedValue({
       role: 'user',
       autoApproveRequests: true,
