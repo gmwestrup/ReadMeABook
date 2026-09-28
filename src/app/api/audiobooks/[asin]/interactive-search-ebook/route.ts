@@ -43,7 +43,7 @@ const ACTIVE_EBOOK_STATUSES = [
 const RETRYABLE_STATUSES = ['failed', 'awaiting_search'];
 
 // Unified result type for frontend
-export interface EbookSearchResult {
+interface EbookSearchResult {
   guid: string;
   title: string;
   size: number;

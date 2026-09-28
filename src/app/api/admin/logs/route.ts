@@ -14,7 +14,7 @@ const VALID_LIMITS = [25, 50, 100] as const;
 const DEFAULT_LIMIT = 50;
 const ERROR_STATUSES = ['failed', 'stuck'] as const;
 
-export interface LogsWhereParams {
+interface LogsWhereParams {
   status?: string | null;
   type?: string | null;
   search?: string | null;
@@ -53,7 +53,7 @@ function trim(raw: string | null | undefined): string | null {
   return t.length > 0 ? t : null;
 }
 
-export function buildLogsWhere(params: LogsWhereParams): Record<string, any> {
+function buildLogsWhere(params: LogsWhereParams): Record<string, any> {
   const where: Record<string, any> = {};
 
   const status = params.status ?? 'all';

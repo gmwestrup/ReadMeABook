@@ -25,7 +25,7 @@ const VALID_SOURCES = ['organize_fail', 'download_fail', 'manual'] as const;
 const VALID_SORT_FIELDS = ['createdAt', 'releaseName', 'reason'] as const;
 const VALID_SORT_ORDERS = ['asc', 'desc'] as const;
 
-export interface BlocklistWhereParams {
+interface BlocklistWhereParams {
   requestId?: string | null;
   source?: string | null;
   search?: string | null;

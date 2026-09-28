@@ -25,7 +25,7 @@ import {
 const logger = RMABLogger.create('API.InteractiveSearchEbook');
 
 // Unified result type for frontend
-export interface EbookSearchResult {
+interface EbookSearchResult {
   // Common fields (match RankedTorrent shape for UI compatibility)
   guid: string;
   title: string;
