@@ -74,7 +74,6 @@ ENV BUILD_DATE=${BUILD_DATE}
 # Build Next.js application
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV NODE_ENV=production
-ENV TURBOPACK=0
 RUN npm run build -- --webpack
 
 # Reorganize for standalone output
