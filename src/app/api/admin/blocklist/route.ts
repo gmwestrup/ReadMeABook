@@ -60,7 +60,7 @@ function trim(raw: string | null | undefined): string | null {
  * Pure function — same input always yields same output. Exported for tests AND
  * for the DELETE handler so bulk-clear filter scope matches GET exactly.
  */
-export function buildBlocklistWhere(
+function buildBlocklistWhere(
   params: BlocklistWhereParams
 ): Prisma.BlockedReleaseWhereInput {
   const where: Prisma.BlockedReleaseWhereInput = {};
